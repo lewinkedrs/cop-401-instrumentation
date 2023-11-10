@@ -1,0 +1,32 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: flask-autoinstrumentation
+spec:
+  selector:
+    matchLabels:
+      app: flask-autoinstrumentation
+  replicas: 1 # tells deployment to run 2 pods matching the template
+  template:
+    metadata:
+      labels:
+        app: flask-autoinstrumentation
+    spec:
+      containers:
+      - name: nginx
+        image: 209466391465.dkr.ecr.us-east-1.amazonaws.com/riv-instrumentation-auto:latest
+        env:
+        - name: OTEL_OTLP_ENDPOINT
+          value: 10.0.11.115:4317   
+        - name: OTEL_RESOURCE_ATTRIBUTES
+          value: "service.name=python-auto-instrumentation-flask-app"
+        - name: OTEL_METRICS_EXPORTER
+          value: "otlp"
+        - name: OTEL_TRACES_EXPORTER
+          value: "otlp"
+        - name: OTEL_SERVICE_NAME
+          value: "python-auto-instrumentation-flask-app"
+
+            
+        ports:
+        - containerPort: 8080

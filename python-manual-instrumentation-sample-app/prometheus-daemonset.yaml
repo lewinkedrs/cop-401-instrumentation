@@ -1,0 +1,331 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: adot-collector-conf
+  namespace: default
+  labels:
+    app: aws-adot
+    component: adot-collector-conf
+data:
+  adot-collector-config: |
+    receivers:
+      filelog:
+        include: 
+        - /var/log/pods/*/*/*.log 
+        include_file_name: false
+        include_file_path: true
+        operators:
+        - id: get-format
+          routes:
+          - expr: body matches "^\\{"
+            output: parser-docker
+          - expr: body matches "^[^ Z]+ "
+            output: parser-crio
+          - expr: body matches "^[^ Z]+Z"
+            output: parser-containerd
+          type: router
+        - id: parser-crio
+          output: extract_metadata_from_filepath
+          regex: ^(?P<time>[^ Z]+) (?P<stream>stdout|stderr) (?P<logtag>[^ ]*) ?(?P<log>.*)$
+          timestamp:
+            layout: 2006-01-02T15:04:05.999999999Z07:00
+            layout_type: gotime
+            parse_from: attributes.time
+          type: regex_parser
+        - id: parser-containerd    
+          output: extract_metadata_from_filepath
+          regex: ^(?P<time>[^ ^Z]+Z) (?P<stream>stdout|stderr) (?P<logtag>[^ ]*) ?(?P<log>.*)$
+          timestamp:
+            layout: '%Y-%m-%dT%H:%M:%S.%LZ'
+            parse_from: attributes.time
+          type: regex_parser
+        - id: parser-docker
+          output: extract_metadata_from_filepath
+          timestamp:
+            layout: '%Y-%m-%dT%H:%M:%S.%LZ'
+            parse_from: attributes.time
+          type: json_parser
+        - id: extract_metadata_from_filepath
+          parse_from: attributes["log.file.path"]
+          regex: ^.*\/(?P<namespace>[^_]+)_(?P<pod_name>[^_]+)_(?P<uid>[a-f0-9\-]+)\/(?P<container_name>[^\._]+)\/(?P<restart_count>\d+)\.log$
+          type: regex_parser
+        - from: attributes.stream
+          to: attributes["log.iostream"]
+          type: move
+        - from: attributes.container_name
+          to: resource["k8s.container.name"]
+          type: move
+        - from: attributes.namespace
+          to: resource["k8s.namespace.name"]
+          type: move
+        - from: attributes.pod_name
+          to: resource["k8s.pod.name"]
+          type: move
+        - from: attributes.restart_count
+          to: resource["k8s.container.restart_count"]
+          type: move
+        - from: attributes.uid
+          to: resource["k8s.pod.uid"]
+          type: move
+        - from: attributes.log
+          to: body
+          type: move
+        start_at: beginning
+
+      otlp:
+        protocols:
+          grpc:
+            endpoint: ${env:MY_POD_IP}:4317
+          http:
+            endpoint: ${env:MY_POD_IP}:4318    
+      prometheus:
+        config:
+          global:
+            scrape_interval: 15s
+            scrape_timeout: 10s
+
+          scrape_configs:
+          - job_name: 'kubernetes-service-endpoints'
+
+            kubernetes_sd_configs:
+            - role: endpoints
+
+            tls_config:
+              ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+              insecure_skip_verify: true
+            bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+
+            relabel_configs:
+            - source_labels: [__meta_kubernetes_service_annotation_scrape]
+              action: keep
+              regex: true
+    processors:
+      resource:
+        attributes:
+        - action: insert
+          key: env
+          value: eks127
+      k8sattributes:
+      memory_limiter:
+        check_interval: 1s
+        limit_mib: 4000
+        spike_limit_mib: 800
+      filter/creditcard:
+        error_mode: ignore
+        traces:
+          span:
+            - attributes["http.route"] == "/credit-card"
+      batch:
+        send_batch_size: 10000
+        timeout: 10s
+
+    exporters:
+      awscloudwatchlogs:
+        log_group_name: "/adot/riv-cop401"
+        log_stream_name: "cop401"
+        region: "us-east-1"
+        endpoint: "logs.us-east-1.amazonaws.com"
+        log_retention: 365
+        raw_log: false
+      awsxray:
+        region: us-east-1
+        index_all_attributes: true
+      prometheusremotewrite:
+        # replace this with your endpoint
+        endpoint: "https://aps-workspaces.us-east-1.amazonaws.com/workspaces/ws-e1d73028-cbef-4e2d-b7d8-09d899e0321b/api/v1/remote_write"
+        auth:
+          authenticator: sigv4auth
+        namespace: "default"
+      logging:
+        loglevel: debug
+
+    extensions:
+      health_check:
+      pprof:
+        endpoint: :1888
+      zpages:
+        endpoint: :55679
+      # replace this with your region
+      sigv4auth:
+        service: "aps"
+        region: "us-east-1"
+
+    service:
+      extensions: [pprof, zpages, health_check, sigv4auth]
+      pipelines:
+        logs:
+          receivers: [filelog]
+          processors: [k8sattributes, resource]
+          exporters: [awscloudwatchlogs]
+        metrics:
+          receivers: [otlp, prometheus]
+          processors: [batch]
+          exporters: [logging, prometheusremotewrite]
+        traces/1:
+          receivers: [otlp]
+          processors: [filter/creditcard, batch]
+          exporters: [logging, awsxray]
+              
+---
+# create adot-col service account and role binding
+#apiVersion: v1
+#kind: ServiceAccount
+#metadata:
+#  name: amp-iamproxy-ingest-service-account
+#  namespace: adot-col
+#  annotations:
+#    eks.amazonaws.com/role-arn: arn:aws:iam::<YOUR_ACCOUNT_ID>:role/amp-iamproxy-ingest-role
+
+---
+kind: ClusterRole
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: adotcol-admin-role
+rules:
+  - apiGroups: [""]
+    resources:
+    - nodes
+    - namespaces
+    - pods/logs
+    - nodes/proxy
+    - services
+    - endpoints
+    - pods
+    - events
+    - namespaces/status
+    - nodes/spec
+    - pods/status
+    - replicationcontrollers
+    - replicationcontrollers/status
+    - resourcequotas
+    verbs: ["get", "list", "watch"]
+  - apiGroups: 
+    - apps
+    resources:
+    - daemonsets
+    - deployments
+    - replicasets
+    - statefulsets
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+    - extensions
+    resources:
+    - ingresses
+    - daemonsets
+    - deployments
+    - replicasets
+    verbs: ["get", "list", "watch"]
+  - nonResourceURLs: ["/metrics"]
+    verbs: ["get"]
+
+---
+kind: ClusterRoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: adotcol-admin-role-binding
+subjects:
+  - kind: ServiceAccount
+    name: otel-collector
+    namespace: default
+roleRef:
+  kind: ClusterRole
+  name: adotcol-admin-role
+  apiGroup: rbac.authorization.k8s.io
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: adot-collector
+  namespace: default
+  labels:
+    app: aws-adot
+    component: adot-collector
+spec:
+  ports:
+  - name: metrics # Default endpoint for querying metrics.
+    port: 8888
+  selector:
+    component: adot-collector
+  type: NodePort
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: adot-collector
+  namespace: default
+  labels:
+    app: aws-adot
+    component: adot-collector
+spec:
+  selector:
+    matchLabels:
+      app: aws-adot
+      component: adot-collector
+  minReadySeconds: 5
+  template:
+    metadata:
+      labels:
+        app: aws-adot
+        component: adot-collector
+    spec:
+      serviceAccountName: otel-collector
+      containers:
+      - command:
+          - "/awscollector"
+          - "--config=/conf/adot-collector-config.yaml"
+          - "--feature-gates=+adot.receiver.filelog,+adot.exporter.awscloudwatchlogs,+adot.extension.file_storage"
+        image: public.ecr.aws/aws-observability/aws-otel-collector:v0.34.0
+        name: adot-collector
+        resources:
+          limits:
+            cpu: 1
+            memory: 2Gi
+          requests:
+            cpu: 200m
+            memory: 400Mi
+        env:
+          - name: MY_POD_IP
+            valueFrom:
+              fieldRef:
+                apiVersion: v1
+                fieldPath: status.podIP      
+        ports:
+        - containerPort: 8888  # Default endpoint for querying metrics.
+        - containerPort: 4317
+        - containerPort: 4318  
+        volumeMounts:
+        - name: adot-collector-config-vol
+          mountPath: /conf
+        - name: varlogpods
+          mountPath: /var/log/pods
+          readOnly: true
+        - name: varlibdockercontainers
+          mountPath: /var/lib/docker/containers
+          readOnly: true
+        livenessProbe:
+          httpGet:
+            path: /
+            port: 13133 # Health Check extension default port.
+        readinessProbe:
+          httpGet:
+            path: /
+            port: 13133 # Health Check extension default port.
+      volumes:
+        - configMap:
+            name: adot-collector-conf
+            items:
+              - key: adot-collector-config
+                path: adot-collector-config.yaml
+          name: adot-collector-config-vol
+        - name: varlogpods  
+          hostPath:
+            path: /var/log/pods
+        - name: varlibdockercontainers
+          hostPath:
+            path: /var/lib/docker/containers
+---
